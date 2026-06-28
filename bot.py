@@ -12,14 +12,12 @@ from typing import Optional
 import requests
 from dotenv import load_dotenv
 from telegram import Bot
-from telegram.ext import Application
 from telegram.error import RetryAfter, TimedOut
 
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
 logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("telegram.ext").setLevel(logging.WARNING)
 
 load_dotenv()
 
@@ -27,7 +25,7 @@ logging.basicConfig(level=logging.WARNING, format="%(asctime)s - %(levelname)s -
 logger = logging.getLogger("sms_otp_bot")
 
 # ════════════════════════════════════════════════════════════════
-#  CONFIGURATION (all from .env)
+#  CONFIGURATION
 # ════════════════════════════════════════════════════════════════
 TOKEN = os.getenv("BOT_TOKEN")
 GROUP_CHAT_ID = os.getenv("GROUP_CHAT_ID")
@@ -43,14 +41,13 @@ SEEN_PAIRS_FILE = os.path.join(DATA_DIR, "seen_pairs_site8.txt")
 SITE8_BASE_URL = os.getenv("SITE8_BASE_URL", "http://139.99.68.231/ints")
 SITE8_USERNAME = os.getenv("SITE8_USERNAME", "")
 SITE8_PASSWORD = os.getenv("SITE8_PASSWORD", "")
-SITE8_CHECK_INTERVAL = int(os.getenv("SITE8_CHECK_INTERVAL", "3"))  # seconds when idle
+SITE8_CHECK_INTERVAL = int(os.getenv("SITE8_CHECK_INTERVAL", "3"))
 
 INTERNAL_RETRIES = 3
 RETRY_BACKOFF = 15
 MAX_BACKOFF = 120
 REQUEST_TIMEOUT = 60
 
-# Persistent session for the SMS site
 session8 = requests.Session()
 session8.headers.update({
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
@@ -62,7 +59,6 @@ session8.headers.update({
     "Cache-Control": "no-cache",
 })
 
-# Queue to serialise Telegram sends and avoid flooding
 message_queue = asyncio.Queue()
 
 
@@ -227,10 +223,9 @@ async def fetch_data_async(session, base_url):
 
 
 # ════════════════════════════════════════════════════════════════
-#  SEQUENTIAL MESSAGE WORKER (no flooding)
+#  SEQUENTIAL MESSAGE WORKER
 # ════════════════════════════════════════════════════════════════
 async def message_worker(bot: Bot):
-    """Processes the queue one message at a time, handling rate limits."""
     while True:
         row, otp = await message_queue.get()
         try:
@@ -239,12 +234,10 @@ async def message_worker(bot: Bot):
             logger.error(f"Worker error: {e}")
         finally:
             message_queue.task_done()
-        # Tiny delay to stay well within Telegram limits (~20 msg/min)
-        await asyncio.sleep(2)
+        await asyncio.sleep(2)  # safe gap between messages
 
 
 async def send_single_otp(bot: Bot, row, otp: str, max_retries=5):
-    """Send one OTP to the group, respecting RetryAfter."""
     if not GROUP_CHAT_ID_INT:
         return
     number = str(row[2]).strip()
@@ -282,7 +275,7 @@ async def send_single_otp(bot: Bot, row, otp: str, max_retries=5):
 
 
 # ════════════════════════════════════════════════════════════════
-#  MAIN SCRAPER LOOP (dynamic zero‑delay when data is flowing)
+#  MAIN SCRAPER LOOP (dynamic zero‑delay when data flows)
 # ════════════════════════════════════════════════════════════════
 async def monitor_site8(bot: Bot):
     session = session8
@@ -301,7 +294,6 @@ async def monitor_site8(bot: Bot):
     while True:
         rows = await fetch_data_async(session, base_url)
         if rows is None:
-            # Session expired – re-login
             if site_login(session, base_url, username, password):
                 rows = await fetch_data_async(session, base_url)
                 if rows is not None:
@@ -328,57 +320,45 @@ async def monitor_site8(bot: Bot):
             pair = f"{number}|{otp}"
             if pair in seen_pairs:
                 continue
-            # Brand new OTP detected
             new_data_found = True
             seen_pairs.add(pair)
             save_seen_pair(seen_file, number, otp)
             await message_queue.put((row, otp))
 
-        # Dynamic polling: if we just found fresh data, don't sleep at all
-        # This ensures we catch bursts as fast as possible.
-        # When quiet, sleep the configured idle interval.
+        # Dynamic polling: if new data was found, fetch again immediately (0.2s pause)
+        # otherwise wait the configured idle interval.
         if new_data_found:
-            # minimal micro-sleep to avoid 100% CPU, but still immediate re-fetch
             await asyncio.sleep(0.2)
         else:
             await asyncio.sleep(idle_interval)
 
 
-async def safe_monitor(application):
+async def safe_monitor(bot: Bot):
     while True:
         try:
-            await monitor_site8(application.bot)
+            await monitor_site8(bot)
         except Exception:
             logger.error(f"Monitor crashed: {traceback.format_exc()}")
             await asyncio.sleep(60)
 
 
-def main():
+async def main_async():
     if not TOKEN:
-        logger.critical("BOT_TOKEN is missing from environment.")
+        logger.critical("BOT_TOKEN is missing.")
         return
 
-    application = (
-        Application.builder()
-        .token(TOKEN)
-        .connection_pool_size(256)
-        .connect_timeout(30.0)
-        .read_timeout(30.0)
-        .write_timeout(30.0)
-        .pool_timeout(30.0)
-        .build()
-    )
-
-    async def post_init(app: Application):
+    # Create a bare Bot instance – no Application, no polling
+    async with Bot(TOKEN) as bot:
         logger.info("Bot started – launching scraper and queue worker...")
-        asyncio.create_task(message_worker(app.bot))
-        asyncio.create_task(safe_monitor(app))
-
-    application.post_init = post_init
-
-    # No handlers = bot ignores all user messages
-    application.run_polling(allowed_updates=[])
+        # Start the worker and the monitor concurrently
+        await asyncio.gather(
+            message_worker(bot),
+            safe_monitor(bot),
+        )
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(main_async())
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user.")
