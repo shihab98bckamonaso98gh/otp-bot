@@ -38,7 +38,6 @@ SEEN_PAIRS_FILE = os.path.join(DATA_DIR, "seen_pairs_site8.txt")
 SITE8_BASE_URL = os.getenv("SITE8_BASE_URL", "http://139.99.68.231/ints")
 SITE8_USERNAME = os.getenv("SITE8_USERNAME", "")
 SITE8_PASSWORD = os.getenv("SITE8_PASSWORD", "")
-# When idle, how many seconds to wait before the next fetch (default 3)
 IDLE_INTERVAL = int(os.getenv("IDLE_INTERVAL", "3"))
 
 RETRY_BACKOFF = 15
@@ -55,7 +54,6 @@ session8.headers.update({
     "Connection": "close",
 })
 
-# Queue to serialise Telegram sends and avoid flooding
 message_queue = asyncio.Queue()
 
 
@@ -87,6 +85,13 @@ def load_seen_pairs(filename):
 def save_seen_pair(filename, number, otp):
     with open(filename, 'a') as f:
         f.write(f"{number}|{otp}\n")
+
+
+def save_seen_pairs_bulk(filename, pairs):
+    """Write multiple pairs at once – used only during initialisation."""
+    with open(filename, 'w') as f:
+        for number, otp in pairs:
+            f.write(f"{number}|{otp}\n")
 
 
 def extract_otp(sms_text: str) -> Optional[str]:
@@ -217,7 +222,35 @@ async def fetch_data_async(session, base_url):
 
 
 # ════════════════════════════════════════════════════════════════
-#  MESSAGE WORKER (sequential, rate-limited)
+#  INITIAL SEED – record all existing OTPs silently
+# ════════════════════════════════════════════════════════════════
+async def initialize_seen_pairs(session, base_url, seen_file):
+    """Fetch current data once and save all number|otp pairs so we never resend them."""
+    rows = await fetch_data_async(session, base_url)
+    if not rows:
+        logger.warning("Could not fetch initial data – will start from empty seen set.")
+        return
+
+    pairs = set()
+    for row in rows:
+        if len(row) < 9:
+            continue
+        sms_text = str(row[5])
+        otp = extract_otp(sms_text)
+        if not otp:
+            continue
+        number = str(row[2]).strip()
+        pairs.add((number, otp))
+
+    if pairs:
+        save_seen_pairs_bulk(seen_file, pairs)
+        logger.info(f"Pre‑loaded {len(pairs)} existing OTPs into seen file.")
+    else:
+        logger.info("No existing OTPs found during initialisation.")
+
+
+# ════════════════════════════════════════════════════════════════
+#  MESSAGE WORKER (sequential, rate‑limited)
 # ════════════════════════════════════════════════════════════════
 async def message_worker(bot: Bot):
     while True:
@@ -228,8 +261,7 @@ async def message_worker(bot: Bot):
             logger.error(f"Worker error: {e}")
         finally:
             message_queue.task_done()
-        # 3.5s delay to stay well within Telegram's 20 msg/min limit
-        await asyncio.sleep(3.5)
+        await asyncio.sleep(3.5)   # safe gap between messages
 
 
 async def send_single_otp(bot: Bot, row, otp: str, max_retries=5):
@@ -270,7 +302,7 @@ async def send_single_otp(bot: Bot, row, otp: str, max_retries=5):
 
 
 # ════════════════════════════════════════════════════════════════
-#  MAIN SCRAPER LOOP (dynamic, no missed data)
+#  MAIN SCRAPER LOOP
 # ════════════════════════════════════════════════════════════════
 async def monitor_site8(bot: Bot):
     session = session8
@@ -280,8 +312,14 @@ async def monitor_site8(bot: Bot):
     seen_file = SEEN_PAIRS_FILE
     idle = IDLE_INTERVAL
 
+    # Login
     if not site_login(session, base_url, username, password):
         logger.error("Initial login failed – will retry in loop")
+
+    # **Only** send new OTPs: first load all currently existing pairs silently
+    if not os.path.exists(seen_file) or os.path.getsize(seen_file) == 0:
+        logger.info("Seeding seen pairs with existing data (no messages will be sent)...")
+        await initialize_seen_pairs(session, base_url, seen_file)
 
     seen_pairs = load_seen_pairs(seen_file)
     consecutive_failures = 0
@@ -289,7 +327,6 @@ async def monitor_site8(bot: Bot):
     while True:
         rows = await fetch_data_async(session, base_url)
         if rows is None:
-            # Session expired – re-login
             if site_login(session, base_url, username, password):
                 rows = await fetch_data_async(session, base_url)
                 if rows is not None:
@@ -321,10 +358,9 @@ async def monitor_site8(bot: Bot):
             save_seen_pair(seen_file, number, otp)
             await message_queue.put((row, otp))
 
-        # Dynamic speed: if new data arrived, fetch again almost instantly
-        # Otherwise, wait the configured idle interval.
+        # Dynamic speed
         if new_data_found:
-            await asyncio.sleep(0.1)   # 100ms – near instant
+            await asyncio.sleep(0.1)   # instant refetch
         else:
             await asyncio.sleep(idle)
 
@@ -344,7 +380,7 @@ async def main_async():
         return
 
     async with Bot(TOKEN) as bot:
-        logger.info("Bot started – instant scraper + sequential sender active.")
+        logger.info("Bot started – initialising and then monitoring for new OTPs.")
         await asyncio.gather(
             message_worker(bot),
             safe_monitor(bot),
