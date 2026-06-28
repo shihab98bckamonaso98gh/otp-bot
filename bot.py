@@ -27,7 +27,7 @@ logging.basicConfig(level=logging.WARNING, format="%(asctime)s - %(levelname)s -
 logger = logging.getLogger("sms_otp_bot")
 
 # ════════════════════════════════════════════════════════════════
-#  CONFIGURATION
+#  CONFIGURATION (all from .env)
 # ════════════════════════════════════════════════════════════════
 TOKEN = os.getenv("BOT_TOKEN")
 GROUP_CHAT_ID = os.getenv("GROUP_CHAT_ID")
@@ -43,13 +43,14 @@ SEEN_PAIRS_FILE = os.path.join(DATA_DIR, "seen_pairs_site8.txt")
 SITE8_BASE_URL = os.getenv("SITE8_BASE_URL", "http://139.99.68.231/ints")
 SITE8_USERNAME = os.getenv("SITE8_USERNAME", "")
 SITE8_PASSWORD = os.getenv("SITE8_PASSWORD", "")
-SITE8_CHECK_INTERVAL = int(os.getenv("SITE8_CHECK_INTERVAL", "10"))
+SITE8_CHECK_INTERVAL = int(os.getenv("SITE8_CHECK_INTERVAL", "3"))  # seconds when idle
 
 INTERNAL_RETRIES = 3
 RETRY_BACKOFF = 15
 MAX_BACKOFF = 120
 REQUEST_TIMEOUT = 60
 
+# Persistent session for the SMS site
 session8 = requests.Session()
 session8.headers.update({
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
@@ -61,7 +62,7 @@ session8.headers.update({
     "Cache-Control": "no-cache",
 })
 
-# Queue to prevent flooding
+# Queue to serialise Telegram sends and avoid flooding
 message_queue = asyncio.Queue()
 
 
@@ -226,27 +227,26 @@ async def fetch_data_async(session, base_url):
 
 
 # ════════════════════════════════════════════════════════════════
-#  MESSAGE WORKER (sequential sender)
+#  SEQUENTIAL MESSAGE WORKER (no flooding)
 # ════════════════════════════════════════════════════════════════
 async def message_worker(bot: Bot):
-    """Processes the queue one message at a time, with retry and delay."""
+    """Processes the queue one message at a time, handling rate limits."""
     while True:
         row, otp = await message_queue.get()
         try:
             await send_single_otp(bot, row, otp)
         except Exception as e:
-            logger.error(f"Unexpected error in worker: {e}")
+            logger.error(f"Worker error: {e}")
         finally:
             message_queue.task_done()
-        # Small delay to stay under Telegram's rate limit (~20 msg/min → 3 sec per msg)
+        # Tiny delay to stay well within Telegram limits (~20 msg/min)
         await asyncio.sleep(2)
 
 
 async def send_single_otp(bot: Bot, row, otp: str, max_retries=5):
-    """Send one OTP to the group, handling RetryAfter with automatic backoff."""
+    """Send one OTP to the group, respecting RetryAfter."""
     if not GROUP_CHAT_ID_INT:
         return
-
     number = str(row[2]).strip()
     cli = str(row[3]).strip() if len(row) > 3 else ""
     sms = str(row[5]).strip() if len(row) > 5 else ""
@@ -258,7 +258,6 @@ async def send_single_otp(bot: Bot, row, otp: str, max_retries=5):
         f"🔑 OTP: {h(otp)}\n\n"
         f"💬 Message:\n{h(sms)}"
     )
-
     for attempt in range(1, max_retries + 1):
         try:
             await bot.send_message(
@@ -268,10 +267,10 @@ async def send_single_otp(bot: Bot, row, otp: str, max_retries=5):
                 read_timeout=30,
                 write_timeout=30,
             )
-            return  # success
+            return
         except RetryAfter as e:
             wait = e.retry_after
-            logger.warning(f"Flood control – sleeping {wait}s")
+            logger.warning(f"Flood control – waiting {wait}s")
             await asyncio.sleep(wait)
         except TimedOut:
             logger.warning(f"Timed out (attempt {attempt}/{max_retries})")
@@ -283,7 +282,7 @@ async def send_single_otp(bot: Bot, row, otp: str, max_retries=5):
 
 
 # ════════════════════════════════════════════════════════════════
-#  MAIN MONITOR LOOP
+#  MAIN SCRAPER LOOP (dynamic zero‑delay when data is flowing)
 # ════════════════════════════════════════════════════════════════
 async def monitor_site8(bot: Bot):
     session = session8
@@ -291,7 +290,7 @@ async def monitor_site8(bot: Bot):
     username = SITE8_USERNAME
     password = SITE8_PASSWORD
     seen_file = SEEN_PAIRS_FILE
-    interval = SITE8_CHECK_INTERVAL
+    idle_interval = SITE8_CHECK_INTERVAL
 
     if not site_login(session, base_url, username, password):
         logger.error("Initial login failed – will retry in loop")
@@ -302,6 +301,7 @@ async def monitor_site8(bot: Bot):
     while True:
         rows = await fetch_data_async(session, base_url)
         if rows is None:
+            # Session expired – re-login
             if site_login(session, base_url, username, password):
                 rows = await fetch_data_async(session, base_url)
                 if rows is not None:
@@ -316,6 +316,7 @@ async def monitor_site8(bot: Bot):
         else:
             consecutive_failures = 0
 
+        new_data_found = False
         for row in rows:
             if len(row) < 9:
                 continue
@@ -327,13 +328,20 @@ async def monitor_site8(bot: Bot):
             pair = f"{number}|{otp}"
             if pair in seen_pairs:
                 continue
+            # Brand new OTP detected
+            new_data_found = True
             seen_pairs.add(pair)
             save_seen_pair(seen_file, number, otp)
-
-            # Put into queue for sequential sending (no concurrent spam)
             await message_queue.put((row, otp))
 
-        await asyncio.sleep(interval)
+        # Dynamic polling: if we just found fresh data, don't sleep at all
+        # This ensures we catch bursts as fast as possible.
+        # When quiet, sleep the configured idle interval.
+        if new_data_found:
+            # minimal micro-sleep to avoid 100% CPU, but still immediate re-fetch
+            await asyncio.sleep(0.2)
+        else:
+            await asyncio.sleep(idle_interval)
 
 
 async def safe_monitor(application):
@@ -353,7 +361,7 @@ def main():
     application = (
         Application.builder()
         .token(TOKEN)
-        .connection_pool_size(256)          # avoid pool timeouts
+        .connection_pool_size(256)
         .connect_timeout(30.0)
         .read_timeout(30.0)
         .write_timeout(30.0)
@@ -362,15 +370,13 @@ def main():
     )
 
     async def post_init(app: Application):
-        logger.info("Bot started – launching monitor and message worker...")
-        # Start the sequential sender
+        logger.info("Bot started – launching scraper and queue worker...")
         asyncio.create_task(message_worker(app.bot))
-        # Start the scraper
         asyncio.create_task(safe_monitor(app))
 
     application.post_init = post_init
 
-    # No handlers – the bot ignores all updates
+    # No handlers = bot ignores all user messages
     application.run_polling(allowed_updates=[])
 
 
