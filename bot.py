@@ -5,7 +5,6 @@ import os
 import re
 import time
 import traceback
-import warnings
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -16,8 +15,6 @@ from telegram.error import RetryAfter, TimedOut
 
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-warnings.filterwarnings("ignore", category=UserWarning)
-logging.getLogger("httpx").setLevel(logging.WARNING)
 
 load_dotenv()
 
@@ -25,7 +22,7 @@ logging.basicConfig(level=logging.WARNING, format="%(asctime)s - %(levelname)s -
 logger = logging.getLogger("sms_otp_bot")
 
 # ════════════════════════════════════════════════════════════════
-#  CONFIGURATION
+#  CONFIGURATION – everything from .env
 # ════════════════════════════════════════════════════════════════
 TOKEN = os.getenv("BOT_TOKEN")
 GROUP_CHAT_ID = os.getenv("GROUP_CHAT_ID")
@@ -41,9 +38,9 @@ SEEN_PAIRS_FILE = os.path.join(DATA_DIR, "seen_pairs_site8.txt")
 SITE8_BASE_URL = os.getenv("SITE8_BASE_URL", "http://139.99.68.231/ints")
 SITE8_USERNAME = os.getenv("SITE8_USERNAME", "")
 SITE8_PASSWORD = os.getenv("SITE8_PASSWORD", "")
-SITE8_CHECK_INTERVAL = int(os.getenv("SITE8_CHECK_INTERVAL", "3"))
+# When idle, how many seconds to wait before the next fetch (default 3)
+IDLE_INTERVAL = int(os.getenv("IDLE_INTERVAL", "3"))
 
-INTERNAL_RETRIES = 3
 RETRY_BACKOFF = 15
 MAX_BACKOFF = 120
 REQUEST_TIMEOUT = 60
@@ -56,9 +53,9 @@ session8.headers.update({
     "Referer": f"{SITE8_BASE_URL}/agent/SMSCDRReports",
     "X-Requested-With": "XMLHttpRequest",
     "Connection": "close",
-    "Cache-Control": "no-cache",
 })
 
+# Queue to serialise Telegram sends and avoid flooding
 message_queue = asyncio.Queue()
 
 
@@ -138,7 +135,7 @@ def extract_otp(sms_text: str) -> Optional[str]:
 def site_login(session, base_url, username, password, retries=3):
     login_url = f"{base_url}/login"
     signin_url = f"{base_url}/signin"
-    for attempt in range(1, retries + 1):
+    for _ in range(retries):
         try:
             resp = session.get(login_url, timeout=REQUEST_TIMEOUT)
         except Exception:
@@ -162,8 +159,7 @@ def site_login(session, base_url, username, password, retries=3):
             except Exception:
                 pass
             return True
-        else:
-            time.sleep(2)
+        time.sleep(2)
     return False
 
 
@@ -193,7 +189,7 @@ def fetch_data_sync(session, base_url):
         "sColumns": "",
         **{f"mDataProp_{i}": str(i) for i in range(9)},
     }
-    for _ in range(INTERNAL_RETRIES):
+    for _ in range(3):
         try:
             resp = session.get(data_url, params=params, timeout=REQUEST_TIMEOUT)
         except Exception:
@@ -212,9 +208,7 @@ def fetch_data_sync(session, base_url):
             time.sleep(2)
             continue
         rows = json_data.get("aaData")
-        if rows is None:
-            return []
-        return rows
+        return rows if rows is not None else []
     return None
 
 
@@ -223,7 +217,7 @@ async def fetch_data_async(session, base_url):
 
 
 # ════════════════════════════════════════════════════════════════
-#  SEQUENTIAL MESSAGE WORKER
+#  MESSAGE WORKER (sequential, rate-limited)
 # ════════════════════════════════════════════════════════════════
 async def message_worker(bot: Bot):
     while True:
@@ -234,7 +228,8 @@ async def message_worker(bot: Bot):
             logger.error(f"Worker error: {e}")
         finally:
             message_queue.task_done()
-        await asyncio.sleep(2)  # safe gap between messages
+        # 3.5s delay to stay well within Telegram's 20 msg/min limit
+        await asyncio.sleep(3.5)
 
 
 async def send_single_otp(bot: Bot, row, otp: str, max_retries=5):
@@ -262,11 +257,11 @@ async def send_single_otp(bot: Bot, row, otp: str, max_retries=5):
             )
             return
         except RetryAfter as e:
-            wait = e.retry_after
+            wait = e.retry_after + 1
             logger.warning(f"Flood control – waiting {wait}s")
             await asyncio.sleep(wait)
         except TimedOut:
-            logger.warning(f"Timed out (attempt {attempt}/{max_retries})")
+            logger.warning(f"Timed out (attempt {attempt})")
             await asyncio.sleep(5)
         except Exception as e:
             logger.error(f"Send error: {e}")
@@ -275,7 +270,7 @@ async def send_single_otp(bot: Bot, row, otp: str, max_retries=5):
 
 
 # ════════════════════════════════════════════════════════════════
-#  MAIN SCRAPER LOOP (dynamic zero‑delay when data flows)
+#  MAIN SCRAPER LOOP (dynamic, no missed data)
 # ════════════════════════════════════════════════════════════════
 async def monitor_site8(bot: Bot):
     session = session8
@@ -283,7 +278,7 @@ async def monitor_site8(bot: Bot):
     username = SITE8_USERNAME
     password = SITE8_PASSWORD
     seen_file = SEEN_PAIRS_FILE
-    idle_interval = SITE8_CHECK_INTERVAL
+    idle = IDLE_INTERVAL
 
     if not site_login(session, base_url, username, password):
         logger.error("Initial login failed – will retry in loop")
@@ -294,6 +289,7 @@ async def monitor_site8(bot: Bot):
     while True:
         rows = await fetch_data_async(session, base_url)
         if rows is None:
+            # Session expired – re-login
             if site_login(session, base_url, username, password):
                 rows = await fetch_data_async(session, base_url)
                 if rows is not None:
@@ -325,12 +321,12 @@ async def monitor_site8(bot: Bot):
             save_seen_pair(seen_file, number, otp)
             await message_queue.put((row, otp))
 
-        # Dynamic polling: if new data was found, fetch again immediately (0.2s pause)
-        # otherwise wait the configured idle interval.
+        # Dynamic speed: if new data arrived, fetch again almost instantly
+        # Otherwise, wait the configured idle interval.
         if new_data_found:
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(0.1)   # 100ms – near instant
         else:
-            await asyncio.sleep(idle_interval)
+            await asyncio.sleep(idle)
 
 
 async def safe_monitor(bot: Bot):
@@ -344,13 +340,11 @@ async def safe_monitor(bot: Bot):
 
 async def main_async():
     if not TOKEN:
-        logger.critical("BOT_TOKEN is missing.")
+        logger.critical("BOT_TOKEN missing.")
         return
 
-    # Create a bare Bot instance – no Application, no polling
     async with Bot(TOKEN) as bot:
-        logger.info("Bot started – launching scraper and queue worker...")
-        # Start the worker and the monitor concurrently
+        logger.info("Bot started – instant scraper + sequential sender active.")
         await asyncio.gather(
             message_worker(bot),
             safe_monitor(bot),
@@ -361,4 +355,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main_async())
     except KeyboardInterrupt:
-        logger.info("Bot stopped by user.")
+        logger.info("Stopped by user.")
