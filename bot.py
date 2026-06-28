@@ -22,7 +22,7 @@ logging.basicConfig(level=logging.WARNING, format="%(asctime)s - %(levelname)s -
 logger = logging.getLogger("sms_otp_bot")
 
 # ════════════════════════════════════════════════════════════════
-#  CONFIGURATION – everything from .env
+#  CONFIGURATION – all from .env
 # ════════════════════════════════════════════════════════════════
 TOKEN = os.getenv("BOT_TOKEN")
 GROUP_CHAT_ID = os.getenv("GROUP_CHAT_ID")
@@ -88,7 +88,6 @@ def save_seen_pair(filename, number, otp):
 
 
 def save_seen_pairs_bulk(filename, pairs):
-    """Write multiple pairs at once – used only during initialisation."""
     with open(filename, 'w') as f:
         for number, otp in pairs:
             f.write(f"{number}|{otp}\n")
@@ -222,10 +221,9 @@ async def fetch_data_async(session, base_url):
 
 
 # ════════════════════════════════════════════════════════════════
-#  INITIAL SEED – record all existing OTPs silently
+#  INITIAL SEED – silently record all existing OTPs
 # ════════════════════════════════════════════════════════════════
 async def initialize_seen_pairs(session, base_url, seen_file):
-    """Fetch current data once and save all number|otp pairs so we never resend them."""
     rows = await fetch_data_async(session, base_url)
     if not rows:
         logger.warning("Could not fetch initial data – will start from empty seen set.")
@@ -246,11 +244,11 @@ async def initialize_seen_pairs(session, base_url, seen_file):
         save_seen_pairs_bulk(seen_file, pairs)
         logger.info(f"Pre‑loaded {len(pairs)} existing OTPs into seen file.")
     else:
-        logger.info("No existing OTPs found during initialisation.")
+        logger.info("No existing OTPs found.")
 
 
 # ════════════════════════════════════════════════════════════════
-#  MESSAGE WORKER (sequential, rate‑limited)
+#  MESSAGE WORKER – one at a time, never floods
 # ════════════════════════════════════════════════════════════════
 async def message_worker(bot: Bot):
     while True:
@@ -261,7 +259,8 @@ async def message_worker(bot: Bot):
             logger.error(f"Worker error: {e}")
         finally:
             message_queue.task_done()
-        await asyncio.sleep(3.5)   # safe gap between messages
+        # 3 seconds between messages → 20 per minute, well within limit
+        await asyncio.sleep(3.0)
 
 
 async def send_single_otp(bot: Bot, row, otp: str, max_retries=5):
@@ -302,7 +301,7 @@ async def send_single_otp(bot: Bot, row, otp: str, max_retries=5):
 
 
 # ════════════════════════════════════════════════════════════════
-#  MAIN SCRAPER LOOP
+#  MAIN SCRAPER – instant re‑fetch when new data appears
 # ════════════════════════════════════════════════════════════════
 async def monitor_site8(bot: Bot):
     session = session8
@@ -312,13 +311,12 @@ async def monitor_site8(bot: Bot):
     seen_file = SEEN_PAIRS_FILE
     idle = IDLE_INTERVAL
 
-    # Login
     if not site_login(session, base_url, username, password):
         logger.error("Initial login failed – will retry in loop")
 
-    # **Only** send new OTPs: first load all currently existing pairs silently
+    # Seed the seen file so we don't resend old data
     if not os.path.exists(seen_file) or os.path.getsize(seen_file) == 0:
-        logger.info("Seeding seen pairs with existing data (no messages will be sent)...")
+        logger.info("Seeding seen pairs (no messages will be sent)...")
         await initialize_seen_pairs(session, base_url, seen_file)
 
     seen_pairs = load_seen_pairs(seen_file)
@@ -358,9 +356,9 @@ async def monitor_site8(bot: Bot):
             save_seen_pair(seen_file, number, otp)
             await message_queue.put((row, otp))
 
-        # Dynamic speed
+        # Instant re‑fetch if new data was found; otherwise wait normally
         if new_data_found:
-            await asyncio.sleep(0.1)   # instant refetch
+            await asyncio.sleep(0.1)   # nearly immediate
         else:
             await asyncio.sleep(idle)
 
@@ -380,7 +378,7 @@ async def main_async():
         return
 
     async with Bot(TOKEN) as bot:
-        logger.info("Bot started – initialising and then monitoring for new OTPs.")
+        logger.info("Bot started – instant scraper + throttled sender active.")
         await asyncio.gather(
             message_worker(bot),
             safe_monitor(bot),
