@@ -33,23 +33,42 @@ except ValueError:
 
 DATA_DIR = os.getenv("DATA_DIR", "/data")
 os.makedirs(DATA_DIR, exist_ok=True)
-SEEN_PAIRS_FILE = os.path.join(DATA_DIR, "seen_pairs_site8.txt")
 
+# Site 8 (original)
 SITE8_BASE_URL = os.getenv("SITE8_BASE_URL", "http://139.99.68.231/ints")
 SITE8_USERNAME = os.getenv("SITE8_USERNAME", "")
 SITE8_PASSWORD = os.getenv("SITE8_PASSWORD", "")
+SEEN_PAIRS_FILE_8 = os.path.join(DATA_DIR, "seen_pairs_site8.txt")
+
+# Site 9 (new)
+SITE9_BASE_URL = os.getenv("SITE9_BASE_URL", "http://54.38.92.155/ints")
+SITE9_USERNAME = os.getenv("SITE9_USERNAME", "")
+SITE9_PASSWORD = os.getenv("SITE9_PASSWORD", "")
+SEEN_PAIRS_FILE_9 = os.path.join(DATA_DIR, "seen_pairs_site9.txt")
+
 IDLE_INTERVAL = int(os.getenv("IDLE_INTERVAL", "3"))
 
 RETRY_BACKOFF = 15
 MAX_BACKOFF = 120
 REQUEST_TIMEOUT = 60
 
+# Shared HTTP sessions
 session8 = requests.Session()
 session8.headers.update({
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
     "Accept": "application/json, text/javascript, */*; q=0.01",
     "Accept-Language": "en-US,en;q=0.9",
     "Referer": f"{SITE8_BASE_URL}/agent/SMSCDRReports",
+    "X-Requested-With": "XMLHttpRequest",
+    "Connection": "close",
+})
+
+session9 = requests.Session()
+session9.headers.update({
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/javascript, */*; q=0.01",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": f"{SITE9_BASE_URL}/agent/SMSCDRReports",
     "X-Requested-With": "XMLHttpRequest",
     "Connection": "close",
 })
@@ -134,7 +153,7 @@ def extract_otp(sms_text: str) -> Optional[str]:
 
 
 # ════════════════════════════════════════════════════════════════
-#  SITE LOGIN & FETCH
+#  SITE LOGIN & FETCH (reused for both sites)
 # ════════════════════════════════════════════════════════════════
 def site_login(session, base_url, username, password, retries=3):
     login_url = f"{base_url}/login"
@@ -226,7 +245,7 @@ async def fetch_data_async(session, base_url):
 async def initialize_seen_pairs(session, base_url, seen_file):
     rows = await fetch_data_async(session, base_url)
     if not rows:
-        logger.warning("Could not fetch initial data – will start from empty seen set.")
+        logger.warning(f"Could not fetch initial data for {base_url} – will start from empty seen set.")
         return
 
     pairs = set()
@@ -242,9 +261,9 @@ async def initialize_seen_pairs(session, base_url, seen_file):
 
     if pairs:
         save_seen_pairs_bulk(seen_file, pairs)
-        logger.info(f"Pre‑loaded {len(pairs)} existing OTPs into seen file.")
+        logger.info(f"Pre‑loaded {len(pairs)} existing OTPs into {seen_file}.")
     else:
-        logger.info("No existing OTPs found.")
+        logger.info(f"No existing OTPs found for {base_url}.")
 
 
 # ════════════════════════════════════════════════════════════════
@@ -301,22 +320,17 @@ async def send_single_otp(bot: Bot, row, otp: str, max_retries=5):
 
 
 # ════════════════════════════════════════════════════════════════
-#  MAIN SCRAPER – instant re‑fetch when new data appears
+#  MAIN SCRAPER – generic for any site
 # ════════════════════════════════════════════════════════════════
-async def monitor_site8(bot: Bot):
-    session = session8
-    base_url = SITE8_BASE_URL
-    username = SITE8_USERNAME
-    password = SITE8_PASSWORD
-    seen_file = SEEN_PAIRS_FILE
+async def monitor_site(bot: Bot, session, base_url, username, password, seen_file, site_label="site"):
     idle = IDLE_INTERVAL
 
     if not site_login(session, base_url, username, password):
-        logger.error("Initial login failed – will retry in loop")
+        logger.error(f"[{site_label}] Initial login failed – will retry in loop")
 
     # Seed the seen file so we don't resend old data
     if not os.path.exists(seen_file) or os.path.getsize(seen_file) == 0:
-        logger.info("Seeding seen pairs (no messages will be sent)...")
+        logger.info(f"[{site_label}] Seeding seen pairs (no messages will be sent)...")
         await initialize_seen_pairs(session, base_url, seen_file)
 
     seen_pairs = load_seen_pairs(seen_file)
@@ -363,26 +377,44 @@ async def monitor_site8(bot: Bot):
             await asyncio.sleep(idle)
 
 
-async def safe_monitor(bot: Bot):
+async def safe_monitor(bot: Bot, session, base_url, username, password, seen_file, site_label):
     while True:
         try:
-            await monitor_site8(bot)
+            await monitor_site(bot, session, base_url, username, password, seen_file, site_label)
         except Exception:
-            logger.error(f"Monitor crashed: {traceback.format_exc()}")
+            logger.error(f"[{site_label}] Monitor crashed: {traceback.format_exc()}")
             await asyncio.sleep(60)
 
 
+# ════════════════════════════════════════════════════════════════
+#  MAIN ENTRY POINT
+# ════════════════════════════════════════════════════════════════
 async def main_async():
     if not TOKEN:
         logger.critical("BOT_TOKEN missing.")
         return
 
     async with Bot(TOKEN) as bot:
-        logger.info("Bot started – instant scraper + throttled sender active.")
-        await asyncio.gather(
-            message_worker(bot),
-            safe_monitor(bot),
-        )
+        logger.info("Bot started – dual-site scraper + throttled sender active.")
+        tasks = [message_worker(bot)]
+
+        # Site 8
+        if SITE8_USERNAME and SITE8_PASSWORD:
+            tasks.append(
+                safe_monitor(bot, session8, SITE8_BASE_URL, SITE8_USERNAME, SITE8_PASSWORD, SEEN_PAIRS_FILE_8, "SITE8")
+            )
+        else:
+            logger.warning("SITE8 credentials missing – skipping site 8.")
+
+        # Site 9
+        if SITE9_USERNAME and SITE9_PASSWORD:
+            tasks.append(
+                safe_monitor(bot, session9, SITE9_BASE_URL, SITE9_USERNAME, SITE9_PASSWORD, SEEN_PAIRS_FILE_9, "SITE9")
+            )
+        else:
+            logger.warning("SITE9 credentials missing – skipping site 9.")
+
+        await asyncio.gather(*tasks)
 
 
 if __name__ == "__main__":
