@@ -395,6 +395,10 @@ async def main_async():
         return
 
     async with Bot(TOKEN) as bot:
+        # Delete any existing webhook to avoid "Conflict: can't use getUpdates" errors
+        await bot.delete_webhook(drop_pending_updates=True)
+        logger.info("Webhook deleted – bot is ready to send messages only.")
+
         logger.info("Bot started – dual-site scraper + throttled sender active.")
         tasks = [message_worker(bot)]
 
