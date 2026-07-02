@@ -75,6 +75,9 @@ session9.headers.update({
 
 message_queue = asyncio.Queue()
 
+# In‑memory cache of sent pairs to prevent any duplicates during the same session
+sent_cache = set()
+
 
 # ════════════════════════════════════════════════════════════════
 #  HELPERS
@@ -261,7 +264,10 @@ async def initialize_seen_pairs(session, base_url, seen_file):
 
     if pairs:
         save_seen_pairs_bulk(seen_file, pairs)
-        logger.info(f"Pre‑loaded {len(pairs)} existing OTPs into {seen_file}.")
+        # Also add to global sent_cache so they're never sent even if file load fails
+        for number, otp in pairs:
+            sent_cache.add(f"{number}|{otp}")
+        logger.info(f"Pre‑loaded {len(pairs)} existing OTPs into {seen_file} and sent_cache.")
     else:
         logger.info(f"No existing OTPs found for {base_url}.")
 
@@ -333,7 +339,11 @@ async def monitor_site(bot: Bot, session, base_url, username, password, seen_fil
         logger.info(f"[{site_label}] Seeding seen pairs (no messages will be sent)...")
         await initialize_seen_pairs(session, base_url, seen_file)
 
-    seen_pairs = load_seen_pairs(seen_file)
+    # Load seen pairs from file (in case the cache was not populated by seeding)
+    file_pairs = load_seen_pairs(seen_file)
+    for pair in file_pairs:
+        sent_cache.add(pair)  # ensure they are in the global cache
+
     consecutive_failures = 0
 
     while True:
@@ -363,11 +373,15 @@ async def monitor_site(bot: Bot, session, base_url, username, password, seen_fil
                 continue
             number = str(row[2]).strip()
             pair = f"{number}|{otp}"
-            if pair in seen_pairs:
+
+            # Dual check: file‑based set (from disk) + global in‑memory sent_cache
+            if pair in sent_cache:
                 continue
+
+            # New OTP found – add to cache immediately to prevent duplicate queuing
+            sent_cache.add(pair)
+            save_seen_pair(seen_file, number, otp)   # persist to disk
             new_data_found = True
-            seen_pairs.add(pair)
-            save_seen_pair(seen_file, number, otp)
             await message_queue.put((row, otp))
 
         # Instant re‑fetch if new data was found; otherwise wait normally
